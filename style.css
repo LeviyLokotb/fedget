@@ -1,0 +1,17 @@
+window { 
+    background-color: #8e1c53; 
+    color: #dfdfdf;
+}
+button { 
+    background-color: #ef73c6;
+    color: #8e1c53; 
+    border: 1px solid #8e1c53; 
+    border-radius: 8px; 
+    padding: 4px 8px; 
+}
+button:hover { 
+    background-color: #8e1c53;
+    color: #ef73c6; 
+    border: 1px solid #ef73c6; 
+}
+button:disabled { color: #999; }

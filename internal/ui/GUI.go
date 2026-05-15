@@ -3,12 +3,15 @@ package ui
 import (
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/LeviyLokotb/fedget/internal/core"
 	osprovider "github.com/LeviyLokotb/fedget/internal/os_provider"
 
+	"github.com/gotk3/gotk3/gdk"
 	"github.com/gotk3/gotk3/glib"
 	"github.com/gotk3/gotk3/gtk"
 )
@@ -23,6 +26,7 @@ type GUI struct {
 	checkboxes  map[int]*gtk.CheckButton
 	openButtons map[int]*gtk.Button
 	timer       glib.SourceHandle
+	cssProvider *gtk.CssProvider
 }
 
 func NewGUI(app *core.App) (*GUI, error) {
@@ -30,12 +34,15 @@ func NewGUI(app *core.App) (*GUI, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &GUI{
+	gui := &GUI{
 		app:         app,
 		devices:     dev,
 		checkboxes:  make(map[int]*gtk.CheckButton),
 		openButtons: make(map[int]*gtk.Button),
-	}, nil
+	}
+	err = gui.loadCSS()
+
+	return gui, err
 }
 
 func (g *GUI) Show() {
@@ -117,6 +124,54 @@ func (g *GUI) Show() {
 	win.ShowAll()
 }
 
+func (g *GUI) loadCSS() error {
+	cssProvider, err := gtk.CssProviderNew()
+	if err != nil {
+		return fmt.Errorf("failed to create CSS provider: %v", err)
+	}
+	g.cssProvider = cssProvider
+
+	// Проверяем разные пути
+	pathsToTry := []string{
+		"style.css",
+		"./style.css",
+		filepath.Join(filepath.Dir(os.Args[0]), "style.css"),
+		"/etc/fedget/style.css",
+		filepath.Join(os.Getenv("HOME"), ".config/fedget/style.css"),
+	}
+
+	var loadedCSS bool
+	for _, path := range pathsToTry {
+		if _, err := os.Stat(path); err == nil {
+			err = cssProvider.LoadFromPath(path)
+			if err == nil {
+				log.Printf("Loaded CSS from: %s", path)
+				loadedCSS = true
+				break
+			}
+		}
+	}
+
+	// Если файл не найден, загружаем дефолтный CSS
+	if !loadedCSS {
+		defaultCSS := ""
+		err = cssProvider.LoadFromData(defaultCSS)
+		if err != nil {
+			return fmt.Errorf("failed to load default CSS: %v", err)
+		}
+		log.Println("Using default CSS theme")
+	}
+
+	// Применяем CSS ко всему приложению
+	screen, err := gdk.ScreenGetDefault()
+	if err != nil {
+		return fmt.Errorf("failed to get screen: %v", err)
+	}
+	gtk.AddProviderForScreen(screen, cssProvider, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+	return nil
+}
+
 func (g *GUI) refreshDiskGrid() {
 	// Очистка грида
 	g.grid.GetChildren().Foreach(func(item interface{}) {
@@ -187,7 +242,7 @@ func (g *GUI) refreshDiskGrid() {
 		// Статус
 		statusText := "Unmounted"
 		if device.IsMounted() {
-			statusText = "✓ Mounted"
+			statusText = "Mounted"
 		}
 		statusLabel, _ := gtk.LabelNew(statusText)
 		statusLabel.SetHAlign(gtk.ALIGN_START)
