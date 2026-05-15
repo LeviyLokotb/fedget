@@ -3,22 +3,30 @@ package ui
 import (
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/LeviyLokotb/fedget/internal/core"
 	osprovider "github.com/LeviyLokotb/fedget/internal/os_provider"
 
+	"github.com/gotk3/gotk3/gdk"
+	"github.com/gotk3/gotk3/glib"
 	"github.com/gotk3/gotk3/gtk"
 )
 
 type GUI struct {
 	app         *core.App
 	window      *gtk.Window
-	listBox     *gtk.ListBox
+	grid        *gtk.Grid
+	scrollWin   *gtk.ScrolledWindow
 	statusBar   *gtk.Label
 	devices     []*osprovider.DiskInfo
 	checkboxes  map[int]*gtk.CheckButton
 	openButtons map[int]*gtk.Button
+	timer       glib.SourceHandle
+	cssProvider *gtk.CssProvider
 }
 
 func NewGUI(app *core.App) (*GUI, error) {
@@ -26,12 +34,15 @@ func NewGUI(app *core.App) (*GUI, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &GUI{
+	gui := &GUI{
 		app:         app,
 		devices:     dev,
 		checkboxes:  make(map[int]*gtk.CheckButton),
 		openButtons: make(map[int]*gtk.Button),
-	}, nil
+	}
+	err = gui.loadCSS()
+
+	return gui, err
 }
 
 func (g *GUI) Show() {
@@ -59,14 +70,17 @@ func (g *GUI) Show() {
 	titleLabel.SetMarginBottom(10)
 	mainBox.PackStart(titleLabel, false, false, 0)
 
-	// Создание списка дисков
-	scrollWin, _ := gtk.ScrolledWindowNew(nil, nil)
-	scrollWin.SetPolicy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
+	// Создание скролла и грида
+	g.scrollWin, _ = gtk.ScrolledWindowNew(nil, nil)
+	g.scrollWin.SetPolicy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
 
-	g.listBox, _ = gtk.ListBoxNew()
-	g.listBox.SetSelectionMode(gtk.SELECTION_NONE)
-	scrollWin.Add(g.listBox)
-	mainBox.PackStart(scrollWin, true, true, 0)
+	g.grid, _ = gtk.GridNew()
+	g.grid.SetColumnSpacing(10)
+	g.grid.SetRowSpacing(5)
+	g.grid.SetColumnHomogeneous(false)
+
+	g.scrollWin.Add(g.grid)
+	mainBox.PackStart(g.scrollWin, true, true, 0)
 
 	// Кнопки
 	buttonBox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 10)
@@ -97,78 +111,143 @@ func (g *GUI) Show() {
 	mainBox.PackStart(g.statusBar, false, false, 0)
 
 	win.Add(mainBox)
-	g.refreshDiskList()
+	g.refreshDiskGrid()
+
+	g.timer = glib.TimeoutAdd(300, g.autoRefresh)
+	win.Connect("destroy", func() {
+		if g.timer != 0 {
+			glib.SourceRemove(g.timer)
+		}
+		gtk.MainQuit()
+	})
+
 	win.ShowAll()
 }
 
-func (g *GUI) refreshDiskList() {
-	// Очистка списка
-	for {
-		row := g.listBox.GetRowAtIndex(0)
-		if row == nil {
-			break
-		}
-		g.listBox.Remove(row)
+func (g *GUI) loadCSS() error {
+	cssProvider, err := gtk.CssProviderNew()
+	if err != nil {
+		return fmt.Errorf("failed to create CSS provider: %v", err)
 	}
+	g.cssProvider = cssProvider
+
+	// Проверяем разные пути
+	pathsToTry := []string{
+		"style.css",
+		"./style.css",
+		filepath.Join(filepath.Dir(os.Args[0]), "style.css"),
+		"/etc/fedget/style.css",
+		filepath.Join(os.Getenv("HOME"), ".config/fedget/style.css"),
+	}
+
+	var loadedCSS bool
+	for _, path := range pathsToTry {
+		if _, err := os.Stat(path); err == nil {
+			err = cssProvider.LoadFromPath(path)
+			if err == nil {
+				log.Printf("Loaded CSS from: %s", path)
+				loadedCSS = true
+				break
+			}
+		}
+	}
+
+	// Если файл не найден, загружаем дефолтный CSS
+	if !loadedCSS {
+		defaultCSS := ""
+		err = cssProvider.LoadFromData(defaultCSS)
+		if err != nil {
+			return fmt.Errorf("failed to load default CSS: %v", err)
+		}
+		log.Println("Using default CSS theme")
+	}
+
+	// Применяем CSS ко всему приложению
+	screen, err := gdk.ScreenGetDefault()
+	if err != nil {
+		return fmt.Errorf("failed to get screen: %v", err)
+	}
+	gtk.AddProviderForScreen(screen, cssProvider, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+	return nil
+}
+
+func (g *GUI) refreshDiskGrid() {
+	// Очистка грида
+	g.grid.GetChildren().Foreach(func(item interface{}) {
+		g.grid.Remove(item.(gtk.IWidget))
+	})
 
 	g.checkboxes = make(map[int]*gtk.CheckButton)
 	g.openButtons = make(map[int]*gtk.Button)
 
-	// Создание заголовка списка
-	headerBox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 10)
-
-	headers := []string{"Select", "Device", "Size", "FS Type", "Status", "Mount Point", "Actions"}
-	for _, h := range headers {
-		label, _ := gtk.LabelNew(h)
-		label.SetMarkup(fmt.Sprintf("<b>%s</b>", h))
-		label.SetHAlign(gtk.ALIGN_START)
-		label.SetWidthChars(15)
-		headerBox.PackStart(label, false, false, 0)
+	// Заголовки колонок с фиксированной шириной
+	headers := []struct {
+		title string
+		width int
+	}{
+		{"Select", 60},
+		{"Device", 100},
+		{"Size", 80},
+		{"FS Type", 80},
+		{"Status", 100},
+		{"Mount Point", 180},
+		{"Actions", 80},
 	}
 
-	headerRow, _ := gtk.ListBoxRowNew()
-	headerRow.Add(headerBox)
-	headerRow.SetSensitive(false)
-	g.listBox.Add(headerRow)
+	for col, h := range headers {
+		label, _ := gtk.LabelNew(h.title)
+		label.SetMarkup(fmt.Sprintf("<b>%s</b>", h.title))
+		label.SetHAlign(gtk.ALIGN_START)
+		label.SetWidthChars(h.width / 10)
+		label.SetMarginStart(5)
+		label.SetMarginEnd(5)
+		g.grid.Attach(label, col, 0, 1, 1)
+	}
 
-	// Добавление дисков
+	// Разделительная линия
+	separator, _ := gtk.SeparatorNew(gtk.ORIENTATION_HORIZONTAL)
+	g.grid.Attach(separator, 0, 1, len(headers), 1)
+
+	// Строки с дисками
 	for i, device := range g.devices {
-		rowBox, _ := gtk.BoxNew(gtk.ORIENTATION_HORIZONTAL, 10)
+		row := i + 2 // после заголовка и разделителя
 
-		// Чекбокс
+		// Чекбокс (без галочки по умолчанию)
 		check, _ := gtk.CheckButtonNew()
-		check.SetActive(!device.IsMounted())
+		check.SetActive(false) // Всегда снята по умолчанию
 		check.SetSensitive(true)
-		rowBox.PackStart(check, false, false, 0)
+		check.SetHAlign(gtk.ALIGN_CENTER)
+		g.grid.Attach(check, 0, row, 1, 1)
 		g.checkboxes[i] = check
 
 		// Имя устройства
 		nameLabel, _ := gtk.LabelNew(device.Name)
 		nameLabel.SetHAlign(gtk.ALIGN_START)
-		nameLabel.SetWidthChars(15)
-		rowBox.PackStart(nameLabel, false, false, 0)
+		nameLabel.SetMarginStart(5)
+		g.grid.Attach(nameLabel, 1, row, 1, 1)
 
 		// Размер
 		sizeLabel, _ := gtk.LabelNew(device.MemTotalGb)
 		sizeLabel.SetHAlign(gtk.ALIGN_START)
-		sizeLabel.SetWidthChars(15)
-		rowBox.PackStart(sizeLabel, false, false, 0)
+		sizeLabel.SetMarginStart(5)
+		g.grid.Attach(sizeLabel, 2, row, 1, 1)
 
 		// Файловая система
 		fsLabel, _ := gtk.LabelNew(device.FStype)
 		fsLabel.SetHAlign(gtk.ALIGN_START)
-		fsLabel.SetWidthChars(15)
-		rowBox.PackStart(fsLabel, false, false, 0)
+		fsLabel.SetMarginStart(5)
+		g.grid.Attach(fsLabel, 3, row, 1, 1)
 
 		// Статус
-		statusText := "unmounted"
+		statusText := "Unmounted"
 		if device.IsMounted() {
-			statusText = "mounted"
+			statusText = "Mounted"
 		}
 		statusLabel, _ := gtk.LabelNew(statusText)
 		statusLabel.SetHAlign(gtk.ALIGN_START)
-		statusLabel.SetWidthChars(15)
-		rowBox.PackStart(statusLabel, false, false, 0)
+		statusLabel.SetMarginStart(5)
+		g.grid.Attach(statusLabel, 4, row, 1, 1)
 
 		// Путь монтирования
 		mountPath := "-"
@@ -177,29 +256,27 @@ func (g *GUI) refreshDiskList() {
 		}
 		mountLabel, _ := gtk.LabelNew(mountPath)
 		mountLabel.SetHAlign(gtk.ALIGN_START)
-		mountLabel.SetWidthChars(20)
-		rowBox.PackStart(mountLabel, false, false, 0)
+		mountLabel.SetMarginStart(5)
+		mountLabel.SetEllipsize(2) // Обрезание длинного текста
+		g.grid.Attach(mountLabel, 5, row, 1, 1)
 
 		// Кнопка открытия файлового менеджера
 		openBtn, _ := gtk.ButtonNewWithLabel("Open")
+		openBtn.SetHAlign(gtk.ALIGN_CENTER)
 		if device.IsMounted() {
 			openBtn.SetSensitive(true)
-			deviceCopy := device // захват переменной для замыкания
+			deviceCopy := device
 			openBtn.Connect("clicked", func() {
 				g.openFileManager(deviceCopy)
 			})
 		} else {
 			openBtn.SetSensitive(false)
 		}
-		rowBox.PackStart(openBtn, false, false, 0)
+		g.grid.Attach(openBtn, 6, row, 1, 1)
 		g.openButtons[i] = openBtn
-
-		row, _ := gtk.ListBoxRowNew()
-		row.Add(rowBox)
-		g.listBox.Add(row)
 	}
 
-	g.listBox.ShowAll()
+	g.grid.ShowAll()
 }
 
 // Открытие файлового менеджера в указанной директории
@@ -246,9 +323,11 @@ func (g *GUI) openFileManager(disk *osprovider.DiskInfo) {
 func (g *GUI) mountSelected() {
 	mounted := 0
 	failed := 0
+	selected := false
 
 	for i, device := range g.devices {
 		if check, ok := g.checkboxes[i]; ok && check.GetActive() {
+			selected = true
 			if !device.IsMounted() {
 				err := g.app.MountDisk(device)
 				if err != nil {
@@ -261,8 +340,14 @@ func (g *GUI) mountSelected() {
 		}
 	}
 
-	g.statusBar.SetText(fmt.Sprintf("Mounted: %d, Failed: %d", mounted, failed))
-	g.refreshDiskList()
+	if !selected {
+		g.statusBar.SetText("No disks selected")
+	} else if mounted == 0 && failed == 0 {
+		g.statusBar.SetText("Selected disks are already mounted")
+	} else {
+		g.statusBar.SetText(fmt.Sprintf("Mounted: %d, Failed: %d", mounted, failed))
+	}
+	g.refreshDiskGrid()
 }
 
 func (g *GUI) mountAll() {
@@ -276,15 +361,17 @@ func (g *GUI) mountAll() {
 		g.statusBar.SetText(fmt.Sprintf("Errors mounting: %d disk(s)", len(errs)))
 	}
 
-	g.refreshDiskList()
+	g.refreshDiskGrid()
 }
 
 func (g *GUI) unmountSelected() {
 	unmounted := 0
 	failed := 0
+	selected := false
 
 	for i, device := range g.devices {
 		if check, ok := g.checkboxes[i]; ok && check.GetActive() {
+			selected = true
 			if device.IsMounted() {
 				err := g.app.UnmountDisk(device)
 				if err != nil {
@@ -297,8 +384,14 @@ func (g *GUI) unmountSelected() {
 		}
 	}
 
-	g.statusBar.SetText(fmt.Sprintf("Unmounted: %d, Failed: %d", unmounted, failed))
-	g.refreshDiskList()
+	if !selected {
+		g.statusBar.SetText("No disks selected")
+	} else if unmounted == 0 && failed == 0 {
+		g.statusBar.SetText("Selected disks are not mounted")
+	} else {
+		g.statusBar.SetText(fmt.Sprintf("Unmounted: %d, Failed: %d", unmounted, failed))
+	}
+	g.refreshDiskGrid()
 }
 
 func (g *GUI) refresh() {
@@ -311,6 +404,27 @@ func (g *GUI) refresh() {
 	}
 
 	g.devices = devices
-	g.refreshDiskList()
+	g.refreshDiskGrid()
 	g.statusBar.SetText(fmt.Sprintf("Found %d devices", len(devices)))
+}
+
+func (g *GUI) autoRefresh() bool {
+	devices, err := g.app.GetDevices()
+	if err != nil {
+		log.Printf("Auto-refresh error: %v", err)
+		return true
+	}
+	if len(g.devices) == len(devices) {
+		return true
+	}
+	for _, d := range devices {
+		if strings.TrimSpace(d.Name) == "" {
+			return true
+		}
+	}
+
+	g.devices = devices
+	g.refreshDiskGrid()
+
+	return true
 }
